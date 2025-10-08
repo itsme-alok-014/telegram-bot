@@ -249,12 +249,12 @@ def start_health_server():
 # ===============================================================
 
 def main():
-    start_health_server()
+    start_health_server()   # keep the small HTTP server for Koyeb
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Conversation for /login
+    # Conversation handler for login
     conv = ConversationHandler(
         entry_points=[CommandHandler('login', login_start)],
         states={
@@ -266,16 +266,29 @@ def main():
     )
     dp.add_handler(conv)
 
-    # Other command handlers
+    # Other commands
     dp.add_handler(CommandHandler('save', save_message))
     dp.add_handler(CommandHandler('batch', save_batch))
     dp.add_handler(CommandHandler('cancel', cancel))
 
-    # Start polling
-    updater.start_polling()
-    logger.info("🤖 Bot started successfully. Listening for commands...")
+    # ✅ Webhook mode (instead of polling)
+    port = int(os.environ.get("PORT", 8080))
+    app_url = os.environ.get("KOYEB_APP_URL")
+
+    if not app_url:
+        raise ValueError("⚠️ KOYEB_APP_URL environment variable not set!")
+
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=BOT_TOKEN
+    )
+
+    updater.bot.set_webhook(f"https://{app_url}/{BOT_TOKEN}")
+    logger.info(f"🤖 Bot started using webhook mode on {app_url}")
     updater.idle()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+
