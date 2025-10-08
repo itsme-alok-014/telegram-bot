@@ -1,17 +1,16 @@
-# Dockerfile
+# Use lightweight Python image
 FROM python:3.11-slim
 
-# Install necessary libraries
-RUN pip install --no-cache-dir python-telegram-bot telethon
-
-# Copy code
+# Set work directory
 WORKDIR /app
+
+# Copy files
 COPY . /app
 
-# (Optionally install any other OS dependencies if needed)
-# Example: RUN apt-get update && apt-get install -y libssl-dev
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose port for Koyeb health checks
+# Expose health-check port (for Koyeb)
 EXPOSE 8080
 
 # Run the bot
