@@ -1,9 +1,6 @@
-import logging
 import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-from telegram import Update, ParseMode
+import logging
+from telegram import Update
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
     ConversationHandler, CallbackContext
@@ -17,59 +14,60 @@ from telethon.errors import (
 )
 
 import database
-from config import API_ID, API_HASH, BOT_TOKEN, PORT, ALLOWED_USER_IDS
 from utils import parse_message_link, clamp_int
 
+# Logging setup
 logging.basicConfig(format='[%(levelname)s %(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Conversation states
 ASK_PHONE, ASK_CODE, ASK_PASSWORD = range(3)
 
+# Helper for allowed users
 def ensure_allowed(func):
     def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         uid = getattr(update.effective_user, "id", None)
-        if ALLOWED_USER_IDS and uid not in ALLOWED_USER_IDS:
-            if update.message:
-                update.message.reply_text("🚫 Not authorized.")
-            return ConversationHandler.END
+        if os.environ.get("ALLOWED_USER_IDS"):
+            allowed_ids = set(int(x) for x in os.environ.get("ALLOWED_USER_IDS").split(",") if x.strip().isdigit())
+            if uid not in allowed_ids:
+                if update.message:
+                    update.message.reply_text("🚫 Not authorized.")
+                return ConversationHandler.END
         return func(update, context, *args, **kwargs)
     return wrapper
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
+# Health server (optional, for uptime monitoring)
 def start_health_server():
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
     def run():
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        logger.info(f"Health server at 0.0.0.0:{PORT}")
+        server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), HealthHandler)
         server.serve_forever()
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-
-def build_help_text():
-    return (
-        "🤖 Save-Restricted Extractor Bot\n\n"
-        "Commands:\n"
-        "/start — show this help\n"
-        "/login — authenticate with phone, OTP, and optional 2FA\n"
-        "/logout — remove saved session\n"
-        "/save <t.me link> — fetch one message (media or text)\n"
-        "/range <t.me link> <start_id> <end_id> — fetch a range, in order\n"
-        "/me — show login status\n"
-    )
+    threading.Thread(target=run, daemon=True).start()
 
 @ensure_allowed
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text(build_help_text())
+    update.message.reply_text(
+        "🤖 Save-Restricted Extractor Bot\n\n"
+        "Commands:\n"
+        "/start — show this message\n"
+        "/login — login with phone and OTP\n"
+        "/logout — remove session\n"
+        "/save <t.me link> — fetch message or media\n"
+        "/range <link> <start_id> <end_id> — fetch range\n"
+        "/me — your status"
+    )
 
 @ensure_allowed
 def me(update: Update, context: CallbackContext):
     sess = database.get_session(update.effective_user.id)
     status = "✅ Logged in" if sess else "❌ Not logged in"
-    update.message.reply_text(f"{status}")
+    update.message.reply_text(status)
 
 @ensure_allowed
 def logout_cmd(update: Update, context: CallbackContext):
@@ -78,32 +76,24 @@ def logout_cmd(update: Update, context: CallbackContext):
 
 @ensure_allowed
 def login_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("📞 Send phone number in international format, e.g., +911234567890")
+    update.message.reply_text("📞 Send phone number (+91...):")
     return ASK_PHONE
 
 @ensure_allowed
 def ask_code(update: Update, context: CallbackContext) -> int:
     phone = update.message.text.strip()
     context.user_data["phone"] = phone
-
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(StringSession(), int(os.environ.get("API_ID", 0)), os.environ.get("API_HASH", ""))
     try:
         client.connect()
         client.send_code_request(phone)
         context.user_data["client"] = client
-        update.message.reply_text("🔐 Enter the code you received (Telegram app or SMS).")
+        update.message.reply_text("🔐 Enter code (OTP):")
         return ASK_CODE
-    except FloodWaitError as e:
-        update.message.reply_text(f"⏳ Flood wait: retry in {e.seconds}s.")
-    except RPCError as e:
-        update.message.reply_text(f"❌ Telegram error: {e}")
     except Exception as e:
         update.message.reply_text(f"❌ Error: {e}")
-    finally:
-        # keep client open for next step only if stored
-        if "client" not in context.user_data:
-            client.disconnect()
-    return ConversationHandler.END
+        client.disconnect()
+        return ConversationHandler.END
 
 @ensure_allowed
 def finalize_login(update: Update, context: CallbackContext) -> int:
@@ -111,34 +101,26 @@ def finalize_login(update: Update, context: CallbackContext) -> int:
     client: TelegramClient = context.user_data.get("client")
     phone = context.user_data.get("phone")
     if not client or not phone:
-        update.message.reply_text("❌ Session lost. Start /login again.")
+        update.message.reply_text("❌ Session lost. Try /login again.")
         return ConversationHandler.END
     try:
         client.sign_in(phone=phone, code=code)
+        sess = client.session.save()
+        database.save_session(update.effective_user.id, sess)
+        update.message.reply_text("✅ Logged in and session saved.")
     except SessionPasswordNeededError:
-        update.message.reply_text("🔒 2FA enabled. Send your password now.")
+        update.message.reply_text("🔒 2FA enabled. Send your password:")
         return ASK_PASSWORD
-    except PhoneCodeInvalidError:
-        update.message.reply_text("❌ Invalid code. Use /login to retry.")
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+        update.message.reply_text(f"❌ Error: {e}")
         client.disconnect()
-        context.user_data.clear()
-        return ConversationHandler.END
-    except PhoneCodeExpiredError:
-        update.message.reply_text("⌛ Code expired. Use /login to retry.")
-        client.disconnect()
-        context.user_data.clear()
         return ConversationHandler.END
     except RPCError as e:
         update.message.reply_text(f"❌ Telegram error: {e}")
         client.disconnect()
-        context.user_data.clear()
         return ConversationHandler.END
-
-    sess = client.session.save()
-    database.save_session(update.effective_user.id, sess)
-    client.disconnect()
-    context.user_data.clear()
-    update.message.reply_text("✅ Logged in and session saved.")
+    finally:
+        client.disconnect()
     return ConversationHandler.END
 
 @ensure_allowed
@@ -146,60 +128,44 @@ def ask_password(update: Update, context: CallbackContext) -> int:
     password = update.message.text.strip()
     client: TelegramClient = context.user_data.get("client")
     if not client:
-        update.message.reply_text("❌ Session lost. Start /login again.")
+        update.message.reply_text("❌ Session lost. Try /login.")
         return ConversationHandler.END
     try:
         client.sign_in(password=password)
         sess = client.session.save()
         database.save_session(update.effective_user.id, sess)
-        update.message.reply_text("✅ Logged in with 2FA and session saved.")
+        update.message.reply_text("✅ Logged in with 2FA.")
     except RPCError as e:
-        update.message.reply_text(f"❌ Telegram error: {e}")
+        update.message.reply_text(f"❌ Error: {e}")
     finally:
         client.disconnect()
         context.user_data.clear()
     return ConversationHandler.END
 
-def open_client_for(user_id: int):
-    sess = database.get_session(user_id)
-    if not sess:
-        return None
-    client = TelegramClient(StringSession(sess), API_ID, API_HASH)
-    client.connect()
-    return client
-
 @ensure_allowed
-def save_one(update: Update, context: CallbackContext):
+def save_message(update: Update, context: CallbackContext):
     if not context.args:
         update.message.reply_text("Usage: /save <t.me link>")
         return
-    target, msg_id = parse_message_link(context.args[0])
+    link = context.args[0]
+    target, msg_id = parse_message_link(link)
     if target is None:
-        update.message.reply_text("❌ Unsupported link. Use https://t.me/username/123 or https://t.me/c/12345/678")
+        update.message.reply_text("❌ Invalid link.")
         return
-
-    client = open_client_for(update.effective_user.id)
-    if not client:
-        update.message.reply_text("❌ Not logged in. Use /login first.")
+    sess = database.get_session(update.effective_user.id)
+    if not sess:
+        update.message.reply_text("❌ Not logged in.")
         return
-
+    client = TelegramClient(StringSession(sess), int(os.environ.get("API_ID", 0)), os.environ.get("API_HASH", ""))
     try:
+        client.connect()
         msg = client.get_messages(target, ids=msg_id)
-        if not msg:
-            update.message.reply_text("⚠️ Message not found or no access.")
-            return
         if msg.media:
             fp = client.download_media(msg, file="downloads/")
-            if fp and os.path.exists(fp):
-                with open(fp, "rb") as f:
-                    update.message.reply_document(f, caption=f"ID {msg.id}")
-            else:
-                update.message.reply_text("⚠️ Failed to download media.")
+            with open(fp, "rb") as f:
+                update.message.reply_document(f)
         else:
-            text = msg.message or "(no text)"
-            update.message.reply_text(text[:4000])
-    except RPCError as e:
-        update.message.reply_text(f"❌ Telegram error: {e}")
+            update.message.reply_text(msg.message or "(no text)")
     except Exception as e:
         update.message.reply_text(f"❌ Error: {e}")
     finally:
@@ -208,51 +174,32 @@ def save_one(update: Update, context: CallbackContext):
 @ensure_allowed
 def save_range(update: Update, context: CallbackContext):
     if len(context.args) < 3:
-        update.message.reply_text("Usage: /range <t.me link> <start_id> <end_id>")
+        update.message.reply_text("Usage: /range <link> <start_id> <end_id>")
         return
     link = context.args[0]
     start_id = clamp_int(context.args[1])
     end_id = clamp_int(context.args[2])
-    if start_id is None or end_id is None or start_id <= 0 or end_id <= 0 or start_id > end_id:
-        update.message.reply_text("❌ Invalid IDs. Provide positive integers with start_id ≤ end_id.")
+    if None in (start_id, end_id):
+        update.message.reply_text("Invalid range.")
         return
-
     target, _ = parse_message_link(link)
-    if target is None:
-        update.message.reply_text("❌ Unsupported link.")
+    sess = database.get_session(update.effective_user.id)
+    if not sess:
+        update.message.reply_text("❌ Not logged in.")
         return
-
-    client = open_client_for(update.effective_user.id)
-    if not client:
-        update.message.reply_text("❌ Not logged in. Use /login first.")
-        return
-
-    sent = 0
+    client = TelegramClient(StringSession(sess), int(os.environ.get("API_ID", 0)), os.environ.get("API_HASH", ""))
     try:
-        update.message.reply_text(f"▶️ Starting fetch {start_id} → {end_id} ...")
+        client.connect()
         for mid in range(start_id, end_id + 1):
-            try:
-                msg = client.get_messages(target, ids=mid)
-                if not msg:
-                    continue
-                if msg.media:
-                    fp = client.download_media(msg, file="downloads/")
-                    if fp and os.path.exists(fp):
-                        with open(fp, "rb") as f:
-                            update.message.reply_document(f, caption=f"ID {msg.id}")
-                    else:
-                        continue
-                else:
-                    text = msg.message or "(no text)"
-                    update.message.reply_text(text[:4000])
-                sent += 1
-            except FloodWaitError as e:
-                update.message.reply_text(f"⏳ Flood wait for {e.seconds}s at ID {mid}; pausing.")
-                import time
-                time.sleep(e.seconds + 1)
-            except RPCError:
+            msg = client.get_messages(target, ids=mid)
+            if not msg:
                 continue
-        update.message.reply_text(f"✅ Done. Sent {sent} messages.")
+            if msg.media:
+                fp = client.download_media(msg, file="downloads/")
+                with open(fp, "rb") as f:
+                    update.message.reply_document(f)
+            else:
+                update.message.reply_text(msg.message or "(no text)")
     except Exception as e:
         update.message.reply_text(f"❌ Error: {e}")
     finally:
@@ -264,38 +211,40 @@ def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not set")
-    if not API_ID or not API_HASH:
-        raise ValueError("API_ID/API_HASH not set")
-
-    start_health_server()
-
-    updater = Updater(BOT_TOKEN, use_context=True)
+    # Initialize updater
+    token = os.environ.get("BOT_TOKEN")
+    updater = Updater(token=token, use_context=True)
     dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CommandHandler('me', me))
-    dp.add_handler(CommandHandler('logout', logout_cmd))
-    dp.add_handler(CommandHandler('save', save_one))
-    dp.add_handler(CommandHandler('range', save_range))
-    dp.add_handler(CommandHandler('cancel', cancel))
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler('login', login_start)],
+    # Add handlers
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("me", me))
+    dp.add_handler(CommandHandler("logout", logout_cmd))
+    dp.add_handler(CommandHandler("save", save_message))
+    dp.add_handler(CommandHandler("range", save_range))
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("login", login_start)],
         states={
             ASK_PHONE: [MessageHandler(Filters.text & ~Filters.command, ask_code)],
             ASK_CODE: [MessageHandler(Filters.text & ~Filters.command, finalize_login)],
             ASK_PASSWORD: [MessageHandler(Filters.text & ~Filters.command, ask_password)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-    dp.add_handler(conv)
+    dp.add_handler(conv_handler)
 
-    # Webhook: Render routes traffic to PORT; use secret path = token
-    updater.start_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN)
-    # No external URL hardcoded. Render health checks hit our health server; Telegram will POST to our service’s public URL you configure at BotFather or by reverse proxy.
-    logger.info(f"Bot webhook listening on 0.0.0.0:{PORT}/{BOT_TOKEN}")
+    # Start webhook
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        url_path=os.environ.get("BOT_TOKEN")
+    )
+
+    # Set webhook URL (no port)
+    webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/{os.environ.get('BOT_TOKEN')}"
+    updater.bot.set_webhook(webhook_url)
+    print(f"Webhook set to {webhook_url}")
+
     updater.idle()
 
 if __name__ == "__main__":
