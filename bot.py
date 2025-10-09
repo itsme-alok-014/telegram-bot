@@ -3,15 +3,23 @@ import logging
 import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
-from pyrogram import Client, filters, enums
-from pyrogram.types import Message
 from pyrogram.errors import (
-    ApiIdInvalid, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
-    SessionPasswordNeeded, PasswordHashInvalid, UsernameNotOccupied, 
-    FloodWait, ChatAdminRequired, UserNotParticipant, ChannelPrivate,
-    PeerIdInvalid, MessageNotModified, MessageIdInvalid
+    FloodWait,
+    UserNotParticipant,
+    ChannelPrivate,
+    PeerIdInvalid,
+    MessageIdInvalid,
+    PhoneNumberInvalid,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    SessionPasswordNeeded,
+    PasswordHashInvalid
 )
+
+
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, UserNotParticipant, ChannelPrivate, PeerIdInvalid, MessageIdInvalid
 
 from config import API_ID, API_HASH, BOT_TOKEN, PORT, ALLOWED_USER_IDS
 import database
@@ -20,8 +28,11 @@ logging.basicConfig(format='[%(levelname)s %(asctime)s] %(message)s', level=logg
 logger = logging.getLogger(__name__)
 
 # Ensure downloads directory exists
-if not os.path.exists("downloads"):
-    os.makedirs("downloads")
+os.makedirs("downloads", exist_ok=True)
+
+# Track active batch jobs and cancel requests
+active_jobs = {}
+cancel_requests = {}
 
 def ensure_allowed(func):
     async def wrapper(client: Client, message: Message, *args, **kwargs):
@@ -33,26 +44,19 @@ def ensure_allowed(func):
     return wrapper
 
 def parse_link(link: str):
-    """Parse Telegram links - supports multiple formats"""
-    if not link:
-        return None, None
-        
+    # (Same parse_link function as original)
+    if not link: return None, None
     link = link.strip().rstrip("/")
-    
-    # Private channel/supergroup: https://t.me/c/1234567/123
     if "/c/" in link:
         parts = link.split("/")
         if len(parts) >= 6:
             try:
-                short_id = parts[4] 
-                msg_id = int(parts[5].split("?")[0].split("-")[0])  # Handle ranges like 123-125
-                chat_id = int(f"-100{short_id}")
-                return chat_id, msg_id
-            except (ValueError, IndexError):
+                short_id = parts[4]
+                msg_id = int(parts[5].split("?")[0].split("-")[0])
+                return int(f"-100{short_id}"), msg_id
+            except:
                 pass
-    
-    # Public channel/group: https://t.me/username/123
-    elif "t.me/" in link and "/c/" not in link:
+    elif "t.me/" in link:
         parts = link.split("/")
         if len(parts) >= 5:
             try:
@@ -61,22 +65,21 @@ def parse_link(link: str):
                     username = username[1:]
                 msg_id = int(parts[4].split("?")[0].split("-")[0])
                 return username, msg_id
-            except (ValueError, IndexError):
+            except:
                 pass
-    
     return None, None
 
 def parse_range(text: str):
-    """Parse range from text like '123-130' or '123 - 130'"""
     text = text.strip().replace(" ", "")
     if "-" in text:
         try:
-            start, end = text.split("-")
-            return int(start), int(end)
+            a, b = text.split("-")
+            return int(a), int(b)
         except:
-            pass
+            return None, None
     try:
-        return int(text), int(text)
+        n = int(text)
+        return n, n
     except:
         return None, None
 
@@ -87,8 +90,7 @@ def start_health_server():
             self.end_headers()
             self.wfile.write(b"OK")
         def log_message(self, format, *args):
-            pass  # Suppress access logs
-    
+            pass
     def run():
         try:
             server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
@@ -96,18 +98,11 @@ def start_health_server():
             server.serve_forever()
         except Exception as e:
             logger.error(f"Health server error: {e}")
-    
     threading.Thread(target=run, daemon=True).start()
 
-# Initialize Pyrogram client
-app = Client(
-    "save-restricted-bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+app = Client("save-restricted-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-@app.on_message(filters.command(["start"]))
+@app.on_message(filters.command("start"))
 @ensure_allowed
 async def cmd_start(client: Client, message: Message):
     await message.reply_text(
@@ -117,21 +112,23 @@ async def cmd_start(client: Client, message: Message):
         "• `/logout` — remove saved session\n"
         "• `/save <link>` — fetch one message/media\n"
         "• `/range <link> <start-end>` — fetch range (e.g. 100-110)\n"
-        "• `/me` — show login status\n\n"
+        "• `/batch` — interactive range fetch\n"
+        "• `/me` — show login status\n"
+        "• `/cancel` — cancel current batch\n\n"
         "**Link formats:**\n"
         "• Public: `https://t.me/channel/123`\n"
         "• Private: `https://t.me/c/1234567/123`\n\n"
         "**Note:** You must be a member of private groups/channels."
     )
 
-@app.on_message(filters.command(["me"]))
+@app.on_message(filters.command("me"))
 @ensure_allowed
 async def cmd_me(client: Client, message: Message):
     sess = database.get_session(message.from_user.id)
     status = "✅ Logged in" if sess else "❌ Not logged in"
     await message.reply_text(f"**Status:** {status}")
 
-@app.on_message(filters.command(["logout"]))
+@app.on_message(filters.command("logout"))
 @ensure_allowed
 async def cmd_logout(client: Client, message: Message):
     sess = database.get_session(message.from_user.id)
@@ -141,102 +138,76 @@ async def cmd_logout(client: Client, message: Message):
     else:
         await message.reply_text("❌ No active session found.")
 
-@app.on_message(filters.command(["login"]))
+@app.on_message(filters.command("login"))
 @ensure_allowed
 async def cmd_login(bot: Client, message: Message):
-    # Check if already logged in
     if database.get_session(message.from_user.id):
         await message.reply_text("✅ Already logged in. Use `/logout` to reset.")
         return
-    
     user_id = message.from_user.id
-    
     try:
-        # Ask for phone number
         phone_msg = await bot.ask(
-            user_id, 
+            user_id,
             "📞 **Send your phone number** with country code\n\n"
             "Example: `+919876543210`\n\n"
             "Send `/cancel` to cancel.", 
             timeout=300
         )
-        
         if phone_msg.text == "/cancel":
             return await phone_msg.reply("❌ Login cancelled.")
-        
         phone = phone_msg.text.strip()
+        if not (phone.startswith("+") and len(phone) >= 8):
+            return await phone_msg.reply("❌ Invalid phone format.")
         
-        # Validate phone format
-        if not phone.startswith("+") or len(phone) < 8:
-            return await phone_msg.reply("❌ Invalid phone format. Use: +919876543210")
-        
-        # Create temporary user client for authentication
         u = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
         await u.connect()
-        
         await phone_msg.reply("📤 Sending OTP...")
-        
         try:
-            # Send verification code
             code = await u.send_code(phone)
         except PhoneNumberInvalid:
             await phone_msg.reply("❌ Invalid phone number.")
             await u.disconnect()
             return
         except FloodWait as e:
-            await phone_msg.reply(f"⏳ Too many attempts. Wait {e.value} seconds.")
+            await phone_msg.reply(f"⏳ Wait {e.value} seconds.")
             await u.disconnect()
             return
         except Exception as e:
-            await phone_msg.reply(f"❌ Error sending code: {str(e)}")
+            await phone_msg.reply(f"❌ Error: {e}")
             await u.disconnect()
             return
-        
-        # Ask for OTP
+
         code_msg = await bot.ask(
-            user_id, 
+            user_id,
             "🔐 **Enter the OTP** you received\n\n"
-            "Format: `1 2 3 4 5` (with spaces)\n"
             "Send `/cancel` to cancel.", 
-            filters=filters.text, 
             timeout=300
         )
-        
         if code_msg.text == "/cancel":
             await code_msg.reply("❌ Login cancelled.")
             await u.disconnect()
             return
-        
         phone_code = code_msg.text.replace(" ", "").replace("-", "")
-        
         try:
-            # Sign in with OTP
             await u.sign_in(phone, code.phone_code_hash, phone_code)
-            
         except PhoneCodeInvalid:
             await code_msg.reply("❌ Invalid OTP code.")
             await u.disconnect()
             return
         except PhoneCodeExpired:
-            await code_msg.reply("❌ OTP expired. Try `/login` again.")
+            await code_msg.reply("❌ OTP expired.")
             await u.disconnect()
             return
         except SessionPasswordNeeded:
-            # Handle 2FA
             pwd_msg = await bot.ask(
-                user_id, 
-                "🔒 **2FA enabled**\n\n"
-                "Send your password:\n"
-                "Send `/cancel` to cancel.", 
-                filters=filters.text, 
+                user_id,
+                "🔒 **2FA enabled**\n\nSend your password:", 
                 timeout=300
             )
-            
             if pwd_msg.text == "/cancel":
                 await pwd_msg.reply("❌ Login cancelled.")
                 await u.disconnect()
                 return
-            
             try:
                 await u.check_password(password=pwd_msg.text)
             except PasswordHashInvalid:
@@ -244,236 +215,268 @@ async def cmd_login(bot: Client, message: Message):
                 await u.disconnect()
                 return
         
-        # Export and save session
         session_string = await u.export_session_string()
         await u.disconnect()
-        
         database.save_session(user_id, session_string)
-        
-        await bot.send_message(
-            user_id, 
+        await bot.send_message(user_id,
             "✅ **Logged in successfully!**\n\n"
-            "Session saved. You can now use `/save` and `/range` commands.\n\n"
+            "Session saved. You can now use `/save` and `/range`.\n\n"
             "⚠️ If you get **AUTH_KEY** errors later, use `/logout` then `/login` again."
         )
-        
     except asyncio.TimeoutError:
         await message.reply("⏰ Timeout. Use `/login` to try again.")
     except Exception as e:
-        await message.reply(f"❌ Login error: {str(e)}")
+        await message.reply(f"❌ Login error: {e}")
 
 def get_user_client(user_id: int):
-    """Get authenticated user client"""
     session_str = database.get_session(user_id)
     if not session_str:
         return None
-    
-    return Client(
-        f":memory:", 
-        session_string=session_str, 
-        api_id=API_ID, 
-        api_hash=API_HASH
-    )
+    return Client(":memory:", session_string=session_str, api_id=API_ID, api_hash=API_HASH)
 
-@app.on_message(filters.command(["save"]))
+# Progress callback for editing a status message
+async def progress(current, total, status_msg):
+    percentage = current * 100 / total if total else 0
+    await status_msg.edit_text(f"⬆️ Uploading: {percentage:.1f}%")
+
+# Progress callback for download
+async def download_progress(current, total, status_msg):
+    percentage = current * 100 / total if total else 0
+    await status_msg.edit_text(f"⬇️ Downloading: {percentage:.1f}%")
+
+@app.on_message(filters.command("save"))
 @ensure_allowed
 async def cmd_save(client: Client, message: Message):
     if len(message.command) < 2:
         return await message.reply_text(
-            "**Usage:** `/save <telegram_link>`\n\n"
-            "**Examples:**\n"
-            "• `/save https://t.me/channel/123`\n"
-            "• `/save https://t.me/c/1234567/123`"
+            "**Usage:** `/save <telegram_link>`\n"
+            "Example: `/save https://t.me/channel/123`"
         )
-    
     link = message.command[1]
     target, msg_id = parse_link(link)
-    
     if target is None:
-        return await message.reply_text(
-            f"❌ **Cannot parse link:**\n`{link}`\n\n"
-            "**Supported formats:**\n"
-            "• `https://t.me/channel/123`\n"
-            "• `https://t.me/c/1234567/123`"
-        )
-    
+        return await message.reply_text(f"❌ **Invalid link:** {link}")
     u = get_user_client(message.from_user.id)
     if not u:
         return await message.reply_text("❌ Not logged in. Use `/login` first.")
-    
     try:
         await u.connect()
-        status_msg = await message.reply_text(f"🔍 **Fetching message {msg_id}** from `{target}`...")
-        
-        # Get the message
+        status_msg = await message.reply_text(f"🔍 Fetching message {msg_id}...")
         msg = await u.get_messages(target, msg_id)
-        
         if not msg or msg.empty:
             return await status_msg.edit_text(
-                "⚠️ **Message not found**\n\n"
-                "**Check if:**\n"
-                "• You're a member of this chat\n"
-                "• Message ID exists\n"
-                "• Link is correct"
+                "⚠️ **Message not found**\n"
+                "• Ensure you're a member of this chat.\n"
+                "• Check the message ID and link."
             )
-        
-        # Handle media messages
         if msg.media:
-            await status_msg.edit_text("📥 **Downloading media...**")
-            try:
-                file_path = await u.download_media(msg, file_name="downloads/")
-                if file_path and os.path.exists(file_path):
-                    # Send the file
-                    with open(file_path, 'rb') as f:
-                        if msg.photo:
-                            await message.reply_photo(f, caption=f"📷 Message {msg_id}")
-                        elif msg.video:
-                            await message.reply_video(f, caption=f"🎥 Message {msg_id}")
-                        elif msg.document:
-                            await message.reply_document(f, caption=f"📄 Message {msg_id}")
-                        else:
-                            await message.reply_document(f, caption=f"📎 Message {msg_id}")
-                    
-                    # Clean up
-                    os.remove(file_path)
-                    await status_msg.delete()
-                else:
-                    await status_msg.edit_text("❌ **Failed to download media**")
-            except Exception as e:
-                await status_msg.edit_text(f"❌ **Download error:** {str(e)}")
-        
-        # Handle text messages
+            # Download media with progress
+            download_status = await status_msg.edit_text("📥 Downloading: 0%")
+            file_path = await u.download_media(msg, file_name="downloads/", progress=download_progress, progress_args=(download_status,))
+            if file_path and os.path.exists(file_path):
+                # Upload media with progress
+                await download_status.edit_text("⬆️ Uploading: 0%")
+                with open(file_path, 'rb') as f:
+                    caption = f"**Message {msg_id}:** {msg.caption or ''}"
+                    if msg.photo:
+                        await message.reply_photo(f, caption=caption, disable_web_page_preview=True, progress=progress, progress_args=(download_status,))
+                    elif msg.video:
+                        # Download thumbnail if available:contentReference[oaicite:5]{index=5}
+                        thumb_path = None
+                        if msg.video and msg.video.thumbs:
+                            thumb_file = msg.video.thumbs[-1].file_id
+                            thumb_path = await u.download_media(thumb_file, file_name=f"downloads/thumb_{msg_id}.jpg")
+                        await message.reply_video(f, caption=caption, thumb=thumb_path, progress=progress, progress_args=(download_status,))
+                        if thumb_path and os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+                    elif msg.document:
+                        await message.reply_document(f, caption=caption, progress=progress, progress_args=(download_status,))
+                    elif msg.audio:
+                        await message.reply_audio(f, caption=caption, progress=progress, progress_args=(download_status,))
+                    elif msg.voice:
+                        await message.reply_voice(f, caption=caption, progress=progress, progress_args=(download_status,))
+                    elif msg.animation:
+                        await message.reply_animation(f, caption=caption, progress=progress, progress_args=(download_status,))
+                    elif msg.sticker:
+                        await message.reply_sticker(f)
+                    else:
+                        await message.reply_document(f, caption=caption, progress=progress, progress_args=(download_status,))
+                os.remove(file_path)
+                await download_status.delete()
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ Failed to download media.")
         elif msg.text:
             await status_msg.delete()
-            await message.reply_text(
-                f"📄 **Message {msg_id}:**\n\n{msg.text}",
-                disable_web_page_preview=True
-            )
-        
+            await message.reply_text(f"📄 **Message {msg_id}:**\n\n{msg.text}", disable_web_page_preview=True)
         else:
             await status_msg.edit_text("⚠️ **Message has no text or media**")
-            
     except FloodWait as e:
-        await message.reply_text(f"⏳ **Rate limit:** Wait {e.value} seconds and try again")
+        await message.reply_text(f"⏳ **Rate limit:** Wait {e.value}s.")
     except UserNotParticipant:
-        await message.reply_text("❌ **Not a member** of this chat")
+        await message.reply_text("❌ **Not a member** of this chat.")
     except ChannelPrivate:
-        await message.reply_text("❌ **Private channel** - join first or check link")
+        await message.reply_text("❌ **Private channel** - join first or check the link.")
     except PeerIdInvalid:
-        await message.reply_text("❌ **Invalid chat** - check the link")
+        await message.reply_text("❌ **Invalid chat** - check the link.")
     except MessageIdInvalid:
-        await message.reply_text("❌ **Invalid message ID** - check the number")
+        await message.reply_text("❌ **Invalid message ID** - check the number.")
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** {str(e)}")
+        await message.reply_text(f"❌ **Error:** {e}")
     finally:
         try:
             await u.disconnect()
         except:
             pass
 
-@app.on_message(filters.command(["range"]))
+@app.on_message(filters.command("range"))
 @ensure_allowed
 async def cmd_range(client: Client, message: Message):
     if len(message.command) < 3:
         return await message.reply_text(
-            "**Usage:** `/range <link> <start-end>`\n\n"
-            "**Examples:**\n"
-            "• `/range https://t.me/channel/123 100-110`\n"
-            "• `/range https://t.me/c/1234567/123 5-15`\n\n"
-            "**Max 50 messages per batch**"
+            "**Usage:** `/range <link> <start-end>`\n"
+            "Example: `/range https://t.me/channel 5-15`\n"
+            "Use `/batch` for an interactive flow."
         )
-    
     link = message.command[1]
     range_text = message.command[2]
-    
     target, _ = parse_link(link)
     if target is None:
-        return await message.reply_text(f"❌ **Invalid link format:** `{link}`")
-    
+        return await message.reply_text(f"❌ **Invalid link:** {link}")
     start_id, end_id = parse_range(range_text)
-    if start_id is None or end_id is None:
-        return await message.reply_text(f"❌ **Invalid range:** `{range_text}`\n\nUse format: `100-110`")
-    
+    if start_id is None:
+        return await message.reply_text(f"❌ **Invalid range:** {range_text}")
     if start_id > end_id:
         start_id, end_id = end_id, start_id
-    
-    if end_id - start_id > 50:
-        return await message.reply_text("❌ **Range too large**\n\nMax 50 messages per batch")
-    
+    # No strict limit; warn if huge
+    if end_id - start_id > 1000:
+        return await message.reply_text("❌ **Range too large.** Please use a smaller range.")
     u = get_user_client(message.from_user.id)
     if not u:
         return await message.reply_text("❌ Not logged in. Use `/login` first.")
-    
+    uid = message.from_user.id
+    active_jobs[uid] = True
+    cancel_requests[uid] = False
     try:
         await u.connect()
-        status_msg = await message.reply_text(f"📦 **Fetching {start_id} → {end_id}** from `{target}`...")
-        
+        status_msg = await message.reply_text(f"📦 Fetching messages {start_id} to {end_id} from `{target}`...")
         success_count = 0
         error_count = 0
-        
-        for msg_id in range(start_id, end_id + 1):
+        for msg_id in range(start_id, end_id+1):
+            if cancel_requests.get(uid):
+                await status_msg.edit_text("⏹️ **Batch cancelled by user.**")
+                break
             try:
                 msg = await u.get_messages(target, msg_id)
-                
                 if not msg or msg.empty:
                     error_count += 1
                     continue
-                
-                # Send media
                 if msg.media:
-                    file_path = await u.download_media(msg, file_name="downloads/")
+                    file_status = await message.reply_text(f"📥 Downloading/⬆️ Uploading message {msg_id}: 0%")
+                    file_path = await u.download_media(msg, file_name="downloads/", progress=download_progress, progress_args=(file_status,))
                     if file_path and os.path.exists(file_path):
+                        await file_status.edit_text("⬆️ Uploading: 0%")
+                        caption = f"**Message {msg_id}:** {msg.caption or ''}"
                         with open(file_path, 'rb') as f:
                             if msg.photo:
-                                await message.reply_photo(f, caption=f"📷 {msg_id}")
+                                await message.reply_photo(f, caption=caption, disable_web_page_preview=True,
+                                                          progress=progress, progress_args=(file_status,))
                             elif msg.video:
-                                await message.reply_video(f, caption=f"🎥 {msg_id}")
+                                thumb_path = None
+                                if msg.video and msg.video.thumbs:
+                                    thumb_file = msg.video.thumbs[-1].file_id
+                                    thumb_path = await u.download_media(thumb_file, file_name=f"downloads/thumb_{msg_id}.jpg")
+                                await message.reply_video(f, caption=caption, thumb=thumb_path,
+                                                          progress=progress, progress_args=(file_status,))
+                                if thumb_path and os.path.exists(thumb_path):
+                                    os.remove(thumb_path)
+                            elif msg.document:
+                                await message.reply_document(f, caption=caption, progress=progress, progress_args=(file_status,))
+                            elif msg.audio:
+                                await message.reply_audio(f, caption=caption, progress=progress, progress_args=(file_status,))
+                            elif msg.voice:
+                                await message.reply_voice(f, caption=caption, progress=progress, progress_args=(file_status,))
+                            elif msg.animation:
+                                await message.reply_animation(f, caption=caption, progress=progress, progress_args=(file_status,))
+                            elif msg.sticker:
+                                await message.reply_sticker(f)
                             else:
-                                await message.reply_document(f, caption=f"📄 {msg_id}")
+                                await message.reply_document(f, caption=caption, progress=progress, progress_args=(file_status,))
                         os.remove(file_path)
+                        await file_status.delete()
                         success_count += 1
                     else:
+                        await file_status.edit_text("❌ Download error.")
                         error_count += 1
-                
-                # Send text
                 elif msg.text:
-                    await message.reply_text(
-                        f"📄 **{msg_id}:** {msg.text[:1000]}{'...' if len(msg.text) > 1000 else ''}",
-                        disable_web_page_preview=True
-                    )
+                    await message.reply_text(f"📄 **{msg_id}:** {msg.text}", disable_web_page_preview=True)
                     success_count += 1
-                else:
-                    error_count += 1
-                
-                # Update progress every 10 messages
-                if (msg_id - start_id + 1) % 10 == 0:
-                    await status_msg.edit_text(
-                        f"📦 **Progress:** {msg_id}/{end_id}\n"
-                        f"✅ Success: {success_count} | ❌ Failed: {error_count}"
-                    )
-                
             except FloodWait as e:
-                await status_msg.edit_text(f"⏳ **Rate limit at {msg_id}:** Waiting {e.value}s...")
-                await asyncio.sleep(e.value + 1)
+                await status_msg.edit_text(f"⏳ **Rate limit:** waiting {e.value}s...")
+                await asyncio.sleep(e.value+1)
             except Exception:
                 error_count += 1
                 continue
-        
-        # Final summary
-        await status_msg.edit_text(
-            f"✅ **Range complete!**\n\n"
-            f"**Downloaded:** {success_count}\n"
-            f"**Failed:** {error_count}\n"
-            f"**Range:** {start_id}-{end_id}"
-        )
-        
+        if not cancel_requests.get(uid):
+            await status_msg.edit_text(
+                f"✅ **Range complete!**\n"
+                f"Downloaded: {success_count}\nFailed: {error_count}\n"
+                f"Range: {start_id}-{end_id}"
+            )
     except Exception as e:
-        await message.reply_text(f"❌ **Range error:** {str(e)}")
+        await message.reply_text(f"❌ **Range error:** {e}")
     finally:
+        active_jobs[uid] = False
+        cancel_requests[uid] = False
         try:
             await u.disconnect()
         except:
             pass
+
+@app.on_message(filters.command("batch"))
+@ensure_allowed
+async def cmd_batch(client: Client, message: Message):
+    uid = message.from_user.id
+    await message.reply_text("🔢 **Enter link and range** (e.g. `https://t.me/channel 10-20`). Send `/cancel` to abort.")
+    try:
+        reply = await client.ask(uid, "", timeout=300)  # Wait for user response
+        if not reply or not reply.text:
+            return await message.reply_text("❌ No input received.")
+        text = reply.text.strip()
+        if text == "/cancel":
+            return await message.reply_text("❌ Batch cancelled.")
+        parts = text.split()
+        if len(parts) != 2:
+            return await message.reply_text("❌ Invalid format. Use `link start-end`.")
+        link, range_part = parts
+        target, _ = parse_link(link)
+        if target is None:
+            return await message.reply_text(f"❌ Invalid link: {link}")
+        start_id, end_id = parse_range(range_part)
+        if start_id is None:
+            return await message.reply_text(f"❌ Invalid range: {range_part}")
+        # Invoke the range logic
+        fake = Message(
+            message_id=message.message_id,
+            date=message.date,
+            chat=message.chat,
+            from_user=message.from_user,
+            text=f"/range {link} {start_id}-{end_id}"
+        )
+        await cmd_range(client, fake)
+    except asyncio.TimeoutError:
+        await message.reply_text("⏰ Timeout. Send `/batch` again to start.")
+    except Exception as e:
+        await message.reply_text(f"❌ Batch error: {e}")
+
+@app.on_message(filters.command("cancel"))
+async def cmd_cancel(client: Client, message: Message):
+    uid = message.from_user.id
+    if active_jobs.get(uid):
+        cancel_requests[uid] = True
+        await message.reply_text("⏹️ Cancelled.")
+    else:
+        await message.reply_text("❌ No active operation to cancel.")
 
 if __name__ == "__main__":
     start_health_server()
