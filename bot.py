@@ -1,39 +1,46 @@
+# bot.py
 import os
+import time
+import math
 import logging
-import threading
+import tempfile
 import asyncio
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pyrogram.errors import (
-    FloodWait,
-    UserNotParticipant,
-    ChannelPrivate,
-    PeerIdInvalid,
-    MessageIdInvalid,
-    PhoneNumberInvalid,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    SessionPasswordNeeded,
-    PasswordHashInvalid
-)
-
+from typing import Optional, Tuple, Dict
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, UserNotParticipant, ChannelPrivate, PeerIdInvalid, MessageIdInvalid
+from pyrogram.errors import (
+    FloodWait, UserNotParticipant, ChannelPrivate, PeerIdInvalid, MessageIdInvalid,
+    PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
+    SessionPasswordNeeded, PasswordHashInvalid
+)
 
+# --- Your existing config + database modules (unchanged) ---
 from config import API_ID, API_HASH, BOT_TOKEN, PORT, ALLOWED_USER_IDS
 import database
 
+# -------------- Logging --------------
 logging.basicConfig(format='[%(levelname)s %(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Ensure downloads directory exists
-os.makedirs("downloads", exist_ok=True)
+# -------------- Tunables --------------
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Track active batch jobs and cancel requests
-active_jobs = {}
-cancel_requests = {}
+# concurrency and pacing
+MAX_CONCURRENT_DOWNLOADS = 2          # how many simultaneous message downloads per user
+MSG_DOWNLOAD_DELAY = 0.6              # pause between each download to avoid rate-limits (seconds)
+CHUNK_PROCESS_SIZE = 50               # process ranges in chunks internally (keeps memory bounded)
+PROGRESS_EDIT_INTERVAL = 0.5          # seconds between status message edits
+LARGE_RANGE_WARNING = 5000            # warn if user requests a huge range
 
+# -------------- Job control structures --------------
+active_jobs: Dict[int, asyncio.Event] = {}      # user_id -> cancel_event
+job_locks: Dict[int, asyncio.Semaphore] = {}    # per-user concurrency limit
+
+# -------------- Utils --------------
 def ensure_allowed(func):
     async def wrapper(client: Client, message: Message, *args, **kwargs):
         uid = message.from_user.id if message.from_user else None
@@ -43,9 +50,10 @@ def ensure_allowed(func):
         return await func(client, message, *args, **kwargs)
     return wrapper
 
-def parse_link(link: str):
-    # (Same parse_link function as original)
-    if not link: return None, None
+def parse_link(link: str) -> Tuple[Optional[object], Optional[int]]:
+    """Return (target, msg_id) where target is username or -100... chat id"""
+    if not link:
+        return None, None
     link = link.strip().rstrip("/")
     if "/c/" in link:
         parts = link.split("/")
@@ -69,7 +77,9 @@ def parse_link(link: str):
                 pass
     return None, None
 
-def parse_range(text: str):
+def parse_range(text: str) -> Tuple[Optional[int], Optional[int]]:
+    if not text:
+        return None, None
     text = text.strip().replace(" ", "")
     if "-" in text:
         try:
@@ -89,7 +99,7 @@ def start_health_server():
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
-        def log_message(self, format, *args):
+        def log_message(self, *args):
             pass
     def run():
         try:
@@ -97,11 +107,64 @@ def start_health_server():
             logger.info(f"Health server at 0.0.0.0:{PORT}")
             server.serve_forever()
         except Exception as e:
-            logger.error(f"Health server error: {e}")
+            logger.exception("Health server error")
     threading.Thread(target=run, daemon=True).start()
 
+# -------------- Client (bot) --------------
 app = Client("save-restricted-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# -------------- Helpers for user auth client --------------
+def get_session_string_for_user(user_id: int) -> Optional[str]:
+    """Get the saved session string from your database (as before)."""
+    return database.get_session(user_id)
+
+def get_user_client(user_id: int) -> Optional[Client]:
+    """
+    Create a Pyrogram Client for the user using stored session_string.
+    We prefer session_string to keep it portable across hosts.
+    """
+    session_str = get_session_string_for_user(user_id)
+    if not session_str:
+        return None
+    # Use a named session so Pyrogram can reuse auth/DC information across runs
+    # Using session_string allows restoring the account without needing a physical file
+    return Client(f"user_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+
+# -------------- Progress callback factories --------------
+def make_progress_callback(status_msg: Message):
+    """Return a coroutine function suitable as Pyrogram's progress callback.
+       It edits the provided status_msg, throttling edits to avoid spamming.
+    """
+    last_call = {"t": 0.0}
+
+    async def _progress(current, total, *args):
+        now = time.time()
+        if now - last_call["t"] < PROGRESS_EDIT_INTERVAL and current != total:
+            return  # throttle edits
+        last_call["t"] = now
+        try:
+            pct = (current * 100 / total) if total else 0
+            await status_msg.edit_text(f"⬆️ Uploading: {pct:.1f}%")
+        except Exception:
+            pass
+
+    return _progress
+
+def make_download_progress(status_msg: Message):
+    last_call = {"t": 0.0}
+    async def _progress(current, total, *args):
+        now = time.time()
+        if now - last_call["t"] < PROGRESS_EDIT_INTERVAL and current != total:
+            return
+        last_call["t"] = now
+        try:
+            pct = (current * 100 / total) if total else 0
+            await status_msg.edit_text(f"📥 Downloading: {pct:.1f}%")
+        except Exception:
+            pass
+    return _progress
+
+# -------------- Commands --------------
 @app.on_message(filters.command("start"))
 @ensure_allowed
 async def cmd_start(client: Client, message: Message):
@@ -112,7 +175,7 @@ async def cmd_start(client: Client, message: Message):
         "• `/logout` — remove saved session\n"
         "• `/save <link>` — fetch one message/media\n"
         "• `/range <link> <start-end>` — fetch range (e.g. 100-110)\n"
-        "• `/batch` — interactive range fetch\n"
+        "• `/batch` — interactive range fetch (enter `link start-end`)\n"
         "• `/me` — show login status\n"
         "• `/cancel` — cancel current batch\n\n"
         "**Link formats:**\n"
@@ -138,19 +201,19 @@ async def cmd_logout(client: Client, message: Message):
     else:
         await message.reply_text("❌ No active session found.")
 
+# Login flow (keeps your prior flows but tidier)
 @app.on_message(filters.command("login"))
 @ensure_allowed
 async def cmd_login(bot: Client, message: Message):
-    if database.get_session(message.from_user.id):
+    user = message.from_user
+    uid = user.id
+    if database.get_session(uid):
         await message.reply_text("✅ Already logged in. Use `/logout` to reset.")
         return
-    user_id = message.from_user.id
+
     try:
-        phone_msg = await bot.ask(
-            user_id,
-            "📞 **Send your phone number** with country code\n\n"
-            "Example: `+919876543210`\n\n"
-            "Send `/cancel` to cancel.", 
+        phone_msg = await bot.ask(uid,
+            "📞 Send your phone number with country code (e.g. +919876543210)\n\nSend `/cancel` to abort.",
             timeout=300
         )
         if phone_msg.text == "/cancel":
@@ -158,278 +221,330 @@ async def cmd_login(bot: Client, message: Message):
         phone = phone_msg.text.strip()
         if not (phone.startswith("+") and len(phone) >= 8):
             return await phone_msg.reply("❌ Invalid phone format.")
-        
-        u = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
-        await u.connect()
+
+        # Create temporary client for authentication
+        temp_client = Client(f"temp_login_{uid}", api_id=API_ID, api_hash=API_HASH)
+        await temp_client.connect()
+
         await phone_msg.reply("📤 Sending OTP...")
+
         try:
-            code = await u.send_code(phone)
+            code = await temp_client.send_code(phone)
         except PhoneNumberInvalid:
             await phone_msg.reply("❌ Invalid phone number.")
-            await u.disconnect()
+            await temp_client.disconnect()
             return
         except FloodWait as e:
-            await phone_msg.reply(f"⏳ Wait {e.value} seconds.")
-            await u.disconnect()
+            await phone_msg.reply(f"⏳ Too many attempts. Wait {e.value} seconds.")
+            await temp_client.disconnect()
             return
         except Exception as e:
-            await phone_msg.reply(f"❌ Error: {e}")
-            await u.disconnect()
+            await phone_msg.reply(f"❌ Error sending code: {e}")
+            await temp_client.disconnect()
             return
 
-        code_msg = await bot.ask(
-            user_id,
-            "🔐 **Enter the OTP** you received\n\n"
-            "Send `/cancel` to cancel.", 
-            timeout=300
-        )
+        code_msg = await bot.ask(uid, "🔐 Enter the OTP (or `/cancel`):", timeout=300)
         if code_msg.text == "/cancel":
             await code_msg.reply("❌ Login cancelled.")
-            await u.disconnect()
+            await temp_client.disconnect()
             return
         phone_code = code_msg.text.replace(" ", "").replace("-", "")
+
         try:
-            await u.sign_in(phone, code.phone_code_hash, phone_code)
+            await temp_client.sign_in(phone, code.phone_code_hash, phone_code)
         except PhoneCodeInvalid:
             await code_msg.reply("❌ Invalid OTP code.")
-            await u.disconnect()
+            await temp_client.disconnect()
             return
         except PhoneCodeExpired:
-            await code_msg.reply("❌ OTP expired.")
-            await u.disconnect()
+            await code_msg.reply("❌ OTP expired. Try again.")
+            await temp_client.disconnect()
             return
         except SessionPasswordNeeded:
-            pwd_msg = await bot.ask(
-                user_id,
-                "🔒 **2FA enabled**\n\nSend your password:", 
-                timeout=300
-            )
+            pwd_msg = await bot.ask(uid, "🔒 2FA enabled. Send your password (or `/cancel`):", timeout=300)
             if pwd_msg.text == "/cancel":
                 await pwd_msg.reply("❌ Login cancelled.")
-                await u.disconnect()
+                await temp_client.disconnect()
                 return
             try:
-                await u.check_password(password=pwd_msg.text)
+                await temp_client.check_password(password=pwd_msg.text)
             except PasswordHashInvalid:
                 await pwd_msg.reply("❌ Invalid 2FA password.")
-                await u.disconnect()
+                await temp_client.disconnect()
                 return
-        
-        session_string = await u.export_session_string()
-        await u.disconnect()
-        database.save_session(user_id, session_string)
-        await bot.send_message(user_id,
-            "✅ **Logged in successfully!**\n\n"
-            "Session saved. You can now use `/save` and `/range`.\n\n"
-            "⚠️ If you get **AUTH_KEY** errors later, use `/logout` then `/login` again."
-        )
+
+        # Export session string and save
+        session_str = await temp_client.export_session_string()
+        await temp_client.disconnect()
+        database.save_session(uid, session_str)
+        await bot.send_message(uid, "✅ Logged in and session saved. You can now use `/save`, `/range`, `/batch`.")
     except asyncio.TimeoutError:
-        await message.reply("⏰ Timeout. Use `/login` to try again.")
+        await message.reply_text("⏰ Timeout. Use `/login` again.")
     except Exception as e:
-        await message.reply(f"❌ Login error: {e}")
+        await message.reply_text(f"❌ Login error: {e}")
 
-def get_user_client(user_id: int):
-    session_str = database.get_session(user_id)
-    if not session_str:
-        return None
-    return Client(":memory:", session_string=session_str, api_id=API_ID, api_hash=API_HASH)
-
-# Progress callback for editing a status message
-async def progress(current, total, status_msg):
-    percentage = current * 100 / total if total else 0
-    await status_msg.edit_text(f"⬆️ Uploading: {percentage:.1f}%")
-
-# Progress callback for download
-async def download_progress(current, total, status_msg):
-    percentage = current * 100 / total if total else 0
-    await status_msg.edit_text(f"⬇️ Downloading: {percentage:.1f}%")
-
+# Core single-save command with progress and thumbnail handling
 @app.on_message(filters.command("save"))
 @ensure_allowed
 async def cmd_save(client: Client, message: Message):
     if len(message.command) < 2:
-        return await message.reply_text(
-            "**Usage:** `/save <telegram_link>`\n"
-            "Example: `/save https://t.me/channel/123`"
-        )
+        return await message.reply_text("Usage: `/save <telegram_link>`")
     link = message.command[1]
     target, msg_id = parse_link(link)
-    if target is None:
-        return await message.reply_text(f"❌ **Invalid link:** {link}")
-    u = get_user_client(message.from_user.id)
-    if not u:
+    if not target:
+        return await message.reply_text(f"❌ Cannot parse link: `{link}`")
+    uclient = get_user_client(message.from_user.id)
+    if not uclient:
         return await message.reply_text("❌ Not logged in. Use `/login` first.")
     try:
-        await u.connect()
-        status_msg = await message.reply_text(f"🔍 Fetching message {msg_id}...")
-        msg = await u.get_messages(target, msg_id)
+        await uclient.connect()
+        status_msg = await message.reply_text(f"🔍 Fetching message {msg_id} from `{target}`...")
+        msg = await uclient.get_messages(target, msg_id)
         if not msg or msg.empty:
-            return await status_msg.edit_text(
-                "⚠️ **Message not found**\n"
-                "• Ensure you're a member of this chat.\n"
-                "• Check the message ID and link."
-            )
+            return await status_msg.edit_text("⚠️ Message not found or not accessible.")
         if msg.media:
-            # Download media with progress
+            # Download
             download_status = await status_msg.edit_text("📥 Downloading: 0%")
-            file_path = await u.download_media(msg, file_name="downloads/", progress=download_progress, progress_args=(download_status,))
-            if file_path and os.path.exists(file_path):
-                # Upload media with progress
-                await download_status.edit_text("⬆️ Uploading: 0%")
-                with open(file_path, 'rb') as f:
-                    caption = f"**Message {msg_id}:** {msg.caption or ''}"
-                    if msg.photo:
-                        await message.reply_photo(f, caption=caption, disable_web_page_preview=True, progress=progress, progress_args=(download_status,))
-                    elif msg.video:
-                        # Download thumbnail if available:contentReference[oaicite:5]{index=5}
-                        thumb_path = None
-                        if msg.video and msg.video.thumbs:
-                            thumb_file = msg.video.thumbs[-1].file_id
-                            thumb_path = await u.download_media(thumb_file, file_name=f"downloads/thumb_{msg_id}.jpg")
-                        await message.reply_video(f, caption=caption, thumb=thumb_path, progress=progress, progress_args=(download_status,))
-                        if thumb_path and os.path.exists(thumb_path):
-                            os.remove(thumb_path)
-                    elif msg.document:
-                        await message.reply_document(f, caption=caption, progress=progress, progress_args=(download_status,))
-                    elif msg.audio:
-                        await message.reply_audio(f, caption=caption, progress=progress, progress_args=(download_status,))
-                    elif msg.voice:
-                        await message.reply_voice(f, caption=caption, progress=progress, progress_args=(download_status,))
-                    elif msg.animation:
-                        await message.reply_animation(f, caption=caption, progress=progress, progress_args=(download_status,))
-                    elif msg.sticker:
-                        await message.reply_sticker(f)
-                    else:
-                        await message.reply_document(f, caption=caption, progress=progress, progress_args=(download_status,))
+            dp = make_download_progress(download_status)
+            # include retry wrapper for upload.GetFile timeout
+            file_path = None
+            for attempt in range(4):
+                try:
+                    file_path = await uclient.download_media(msg, file_name=DOWNLOAD_DIR + "/", progress=dp, progress_args=())
+                    break
+                except Exception as e:
+                    logger.warning(f"download attempt {attempt+1} failed: {e}")
+                    await asyncio.sleep(1 + attempt * 2)
+            if not file_path or not os.path.exists(file_path):
+                return await status_msg.edit_text("❌ Failed to download media after retries.")
+            # Upload (bot client sends to the chat)
+            await download_status.edit_text("⬆️ Uploading: 0%")
+            progress_cb = make_progress_callback(download_status)
+            caption = msg.caption or ""
+            # Preserve thumbnails for video
+            thumb_path = None
+            try:
+                if msg.video and getattr(msg.video, "thumbs", None):
+                    thumb = msg.video.thumbs[-1]
+                    thumb_path = await uclient.download_media(thumb.file_id, file_name=DOWNLOAD_DIR + f"/thumb_{msg.id}.jpg")
+            except Exception:
+                thumb_path = None
+            # Use the correct reply_* based on msg type (Pyrogram will detect file type by the file object)
+            with open(file_path, "rb") as fp:
+                if msg.photo:
+                    await message.reply_photo(fp, caption=caption, disable_web_page_preview=True, progress=progress_cb, progress_args=())
+                elif msg.video:
+                    await message.reply_video(fp, caption=caption, thumb=thumb_path, progress=progress_cb, progress_args=())
+                elif msg.document:
+                    await message.reply_document(fp, caption=caption, progress=progress_cb, progress_args=())
+                elif msg.audio:
+                    await message.reply_audio(fp, caption=caption, progress=progress_cb, progress_args=())
+                elif msg.voice:
+                    await message.reply_voice(fp, caption=caption, progress=progress_cb, progress_args=())
+                elif msg.animation:
+                    await message.reply_animation(fp, caption=caption, progress=progress_cb, progress_args=())
+                elif msg.sticker:
+                    await message.reply_sticker(fp)
+                else:
+                    await message.reply_document(fp, caption=caption, progress=progress_cb, progress_args=())
+            # cleanup
+            try:
                 os.remove(file_path)
-                await download_status.delete()
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ Failed to download media.")
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            except Exception:
+                pass
+            await download_status.delete()
+            await status_msg.delete()
         elif msg.text:
             await status_msg.delete()
-            await message.reply_text(f"📄 **Message {msg_id}:**\n\n{msg.text}", disable_web_page_preview=True)
+            await message.reply_text(f"📄 {msg.text}", disable_web_page_preview=True)
         else:
-            await status_msg.edit_text("⚠️ **Message has no text or media**")
+            await status_msg.edit_text("⚠️ Message has no transferable content.")
     except FloodWait as e:
-        await message.reply_text(f"⏳ **Rate limit:** Wait {e.value}s.")
+        await message.reply_text(f"⏳ Rate limited. Wait {e.value} seconds.")
     except UserNotParticipant:
-        await message.reply_text("❌ **Not a member** of this chat.")
+        await message.reply_text("❌ Not a member of that chat.")
     except ChannelPrivate:
-        await message.reply_text("❌ **Private channel** - join first or check the link.")
+        await message.reply_text("❌ Private channel. Join first.")
     except PeerIdInvalid:
-        await message.reply_text("❌ **Invalid chat** - check the link.")
+        await message.reply_text("❌ Invalid chat/link.")
     except MessageIdInvalid:
-        await message.reply_text("❌ **Invalid message ID** - check the number.")
+        await message.reply_text("❌ Invalid message id.")
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** {e}")
+        logger.exception("save error")
+        await message.reply_text(f"❌ Error: {e}")
     finally:
         try:
-            await u.disconnect()
+            await uclient.disconnect()
         except:
             pass
+
+# Range/batch processing core worker
+async def process_message_and_forward(uclient: Client, bot_client: Client, target, msg_id: int, dest_chat_id: int, cancel_event: asyncio.Event):
+    """Downloads a single msg from target via uclient and forwards to dest_chat_id via bot_client.
+       Returns (True/False, reason_str)
+    """
+    if cancel_event.is_set():
+        return False, "cancelled"
+    try:
+        msg = await uclient.get_messages(target, msg_id)
+        if not msg or msg.empty:
+            return False, "not_found"
+        if msg.media:
+            status_msg = await bot_client.send_message(dest_chat_id, f"📥 Downloading/⬆️ Uploading message {msg_id}: 0%")
+            dp = make_download_progress(status_msg)
+            # retry download on transient timeouts
+            file_path = None
+            for attempt in range(4):
+                try:
+                    file_path = await uclient.download_media(msg, file_name=DOWNLOAD_DIR + "/", progress=dp, progress_args=())
+                    break
+                except Exception as e:
+                    logger.warning(f"[{msg_id}] download attempt {attempt+1} failed: {e}")
+                    await asyncio.sleep(1 + attempt * 2)
+                    if cancel_event.is_set():
+                        await status_msg.edit_text("⏹️ Cancelled")
+                        return False, "cancelled"
+            if not file_path or not os.path.exists(file_path):
+                await status_msg.edit_text("❌ Download failed")
+                return False, "download_failed"
+            # prepare upload
+            await status_msg.edit_text("⬆️ Uploading: 0%")
+            upload_cb = make_progress_callback(status_msg)
+            caption = msg.caption or ""
+            thumb_path = None
+            try:
+                if msg.video and getattr(msg.video, "thumbs", None):
+                    thumb = msg.video.thumbs[-1]
+                    thumb_path = await uclient.download_media(thumb.file_id, file_name=DOWNLOAD_DIR + f"/thumb_{msg.id}.jpg")
+            except Exception:
+                thumb_path = None
+            # send
+            try:
+                with open(file_path, "rb") as fp:
+                    if msg.photo:
+                        await bot_client.send_photo(dest_chat_id, fp, caption=caption, disable_web_page_preview=True, progress=upload_cb, progress_args=())
+                    elif msg.video:
+                        await bot_client.send_video(dest_chat_id, fp, caption=caption, thumb=thumb_path, progress=upload_cb, progress_args=())
+                    elif msg.document:
+                        await bot_client.send_document(dest_chat_id, fp, caption=caption, progress=upload_cb, progress_args=())
+                    elif msg.audio:
+                        await bot_client.send_audio(dest_chat_id, fp, caption=caption, progress=upload_cb, progress_args=())
+                    elif msg.voice:
+                        await bot_client.send_voice(dest_chat_id, fp, caption=caption, progress=upload_cb, progress_args=())
+                    elif msg.animation:
+                        await bot_client.send_animation(dest_chat_id, fp, caption=caption, progress=upload_cb, progress_args=())
+                    elif msg.sticker:
+                        await bot_client.send_sticker(dest_chat_id, fp)
+                    else:
+                        await bot_client.send_document(dest_chat_id, fp, caption=caption, progress=upload_cb, progress_args=())
+            except FloodWait as e:
+                await status_msg.edit_text(f"⏳ Rate limited: wait {e.value}s")
+                await asyncio.sleep(e.value + 1)
+                return False, "floodwait"
+            except Exception as e:
+                logger.exception("upload error")
+                await status_msg.edit_text(f"❌ Upload failed: {e}")
+                return False, "upload_failed"
+            finally:
+                # cleanup
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+                if thumb_path:
+                    try:
+                        os.remove(thumb_path)
+                    except:
+                        pass
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+            return True, "ok"
+        elif msg.text:
+            # simple text, forward as text
+            await bot_client.send_message(dest_chat_id, f"📄 {msg.text}", disable_web_page_preview=True)
+            return True, "text_ok"
+        else:
+            return False, "no_content"
+    except FloodWait as e:
+        logger.warning("FloodWait in worker")
+        return False, "floodwait"
+    except Exception as e:
+        logger.exception("process error")
+        return False, "error"
 
 @app.on_message(filters.command("range"))
 @ensure_allowed
 async def cmd_range(client: Client, message: Message):
     if len(message.command) < 3:
-        return await message.reply_text(
-            "**Usage:** `/range <link> <start-end>`\n"
-            "Example: `/range https://t.me/channel 5-15`\n"
-            "Use `/batch` for an interactive flow."
-        )
+        return await message.reply_text("Usage: `/range <link> <start-end>` ; example: `/range https://t.me/channel 5-15`")
     link = message.command[1]
     range_text = message.command[2]
     target, _ = parse_link(link)
-    if target is None:
-        return await message.reply_text(f"❌ **Invalid link:** {link}")
+    if not target:
+        return await message.reply_text("❌ Invalid link format.")
     start_id, end_id = parse_range(range_text)
     if start_id is None:
-        return await message.reply_text(f"❌ **Invalid range:** {range_text}")
+        return await message.reply_text("❌ Invalid range.")
     if start_id > end_id:
         start_id, end_id = end_id, start_id
-    # No strict limit; warn if huge
-    if end_id - start_id > 1000:
-        return await message.reply_text("❌ **Range too large.** Please use a smaller range.")
-    u = get_user_client(message.from_user.id)
-    if not u:
+    total = end_id - start_id + 1
+    if total <= 0:
+        return await message.reply_text("❌ Empty range.")
+    if total > LARGE_RANGE_WARNING:
+        await message.reply_text(f"⚠️ Large range requested ({total} messages). Processing will proceed but may take time.")
+    # check login
+    uclient = get_user_client(message.from_user.id)
+    if not uclient:
         return await message.reply_text("❌ Not logged in. Use `/login` first.")
     uid = message.from_user.id
-    active_jobs[uid] = True
-    cancel_requests[uid] = False
+    # create per-user control primitives
+    cancel_event = asyncio.Event()
+    active_jobs[uid] = cancel_event
+    job_locks[uid] = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     try:
-        await u.connect()
-        status_msg = await message.reply_text(f"📦 Fetching messages {start_id} to {end_id} from `{target}`...")
-        success_count = 0
-        error_count = 0
-        for msg_id in range(start_id, end_id+1):
-            if cancel_requests.get(uid):
-                await status_msg.edit_text("⏹️ **Batch cancelled by user.**")
+        await uclient.connect()
+        status_msg = await message.reply_text(f"📦 Starting range {start_id}-{end_id} ({total} messages). Press /cancel to stop.")
+        succeeded = 0
+        failed = 0
+        # Process in internal chunks to keep memory and pacing controlled
+        current = start_id
+        while current <= end_id:
+            if cancel_event.is_set():
+                await status_msg.edit_text("⏹️ Batch cancelled by user.")
                 break
-            try:
-                msg = await u.get_messages(target, msg_id)
-                if not msg or msg.empty:
-                    error_count += 1
-                    continue
-                if msg.media:
-                    file_status = await message.reply_text(f"📥 Downloading/⬆️ Uploading message {msg_id}: 0%")
-                    file_path = await u.download_media(msg, file_name="downloads/", progress=download_progress, progress_args=(file_status,))
-                    if file_path and os.path.exists(file_path):
-                        await file_status.edit_text("⬆️ Uploading: 0%")
-                        caption = f"**Message {msg_id}:** {msg.caption or ''}"
-                        with open(file_path, 'rb') as f:
-                            if msg.photo:
-                                await message.reply_photo(f, caption=caption, disable_web_page_preview=True,
-                                                          progress=progress, progress_args=(file_status,))
-                            elif msg.video:
-                                thumb_path = None
-                                if msg.video and msg.video.thumbs:
-                                    thumb_file = msg.video.thumbs[-1].file_id
-                                    thumb_path = await u.download_media(thumb_file, file_name=f"downloads/thumb_{msg_id}.jpg")
-                                await message.reply_video(f, caption=caption, thumb=thumb_path,
-                                                          progress=progress, progress_args=(file_status,))
-                                if thumb_path and os.path.exists(thumb_path):
-                                    os.remove(thumb_path)
-                            elif msg.document:
-                                await message.reply_document(f, caption=caption, progress=progress, progress_args=(file_status,))
-                            elif msg.audio:
-                                await message.reply_audio(f, caption=caption, progress=progress, progress_args=(file_status,))
-                            elif msg.voice:
-                                await message.reply_voice(f, caption=caption, progress=progress, progress_args=(file_status,))
-                            elif msg.animation:
-                                await message.reply_animation(f, caption=caption, progress=progress, progress_args=(file_status,))
-                            elif msg.sticker:
-                                await message.reply_sticker(f)
-                            else:
-                                await message.reply_document(f, caption=caption, progress=progress, progress_args=(file_status,))
-                        os.remove(file_path)
-                        await file_status.delete()
-                        success_count += 1
-                    else:
-                        await file_status.edit_text("❌ Download error.")
-                        error_count += 1
-                elif msg.text:
-                    await message.reply_text(f"📄 **{msg_id}:** {msg.text}", disable_web_page_preview=True)
-                    success_count += 1
-            except FloodWait as e:
-                await status_msg.edit_text(f"⏳ **Rate limit:** waiting {e.value}s...")
-                await asyncio.sleep(e.value+1)
-            except Exception:
-                error_count += 1
-                continue
-        if not cancel_requests.get(uid):
-            await status_msg.edit_text(
-                f"✅ **Range complete!**\n"
-                f"Downloaded: {success_count}\nFailed: {error_count}\n"
-                f"Range: {start_id}-{end_id}"
-            )
+            chunk_end = min(current + CHUNK_PROCESS_SIZE - 1, end_id)
+            # process messages in chunk sequentially (you can parallelize within semaphore if desired)
+            for msg_id in range(current, chunk_end + 1):
+                if cancel_event.is_set():
+                    break
+                # respect pacing
+                await asyncio.sleep(MSG_DOWNLOAD_DELAY)
+                ok, reason = await process_message_and_forward(uclient, client, target, msg_id, message.chat.id, cancel_event)
+                if ok:
+                    succeeded += 1
+                else:
+                    failed += 1
+                # update progress summary occasionally
+                if (msg_id - start_id + 1) % 10 == 0:
+                    await status_msg.edit_text(f"📦 Progress: {msg_id}/{end_id}\n✅ {succeeded} | ❌ {failed}")
+            current = chunk_end + 1
+            # small pause between chunks to avoid hitting DC edge cases
+            await asyncio.sleep(0.8)
+        if not cancel_event.is_set():
+            await status_msg.edit_text(f"✅ Range complete!\nDownloaded: {succeeded}\nFailed: {failed}\nRange: {start_id}-{end_id}")
     except Exception as e:
-        await message.reply_text(f"❌ **Range error:** {e}")
+        logger.exception("range error")
+        await message.reply_text(f"❌ Range error: {e}")
     finally:
-        active_jobs[uid] = False
-        cancel_requests[uid] = False
+        # cleanup
+        active_jobs.pop(uid, None)
+        job_locks.pop(uid, None)
         try:
-            await u.disconnect()
+            await uclient.disconnect()
         except:
             pass
 
@@ -437,9 +552,9 @@ async def cmd_range(client: Client, message: Message):
 @ensure_allowed
 async def cmd_batch(client: Client, message: Message):
     uid = message.from_user.id
-    await message.reply_text("🔢 **Enter link and range** (e.g. `https://t.me/channel 10-20`). Send `/cancel` to abort.")
+    await message.reply_text("🔢 Enter `link start-end` (example: `https://t.me/channel 4-20`). Send `/cancel` to abort.")
     try:
-        reply = await client.ask(uid, "", timeout=300)  # Wait for user response
+        reply = await client.ask(uid, "", timeout=300)
         if not reply or not reply.text:
             return await message.reply_text("❌ No input received.")
         text = reply.text.strip()
@@ -449,35 +564,34 @@ async def cmd_batch(client: Client, message: Message):
         if len(parts) != 2:
             return await message.reply_text("❌ Invalid format. Use `link start-end`.")
         link, range_part = parts
-        target, _ = parse_link(link)
-        if target is None:
-            return await message.reply_text(f"❌ Invalid link: {link}")
-        start_id, end_id = parse_range(range_part)
-        if start_id is None:
-            return await message.reply_text(f"❌ Invalid range: {range_part}")
-        # Invoke the range logic
-        fake = Message(
+        # call range handler
+        fake_msg = Message(
             message_id=message.message_id,
             date=message.date,
             chat=message.chat,
             from_user=message.from_user,
-            text=f"/range {link} {start_id}-{end_id}"
+            text=f"/range {link} {range_part}"
         )
-        await cmd_range(client, fake)
+        # Directly call the handler function to reuse logic
+        await cmd_range(client, fake_msg)
     except asyncio.TimeoutError:
-        await message.reply_text("⏰ Timeout. Send `/batch` again to start.")
+        await message.reply_text("⏰ Timeout. Send /batch again.")
     except Exception as e:
+        logger.exception("batch error")
         await message.reply_text(f"❌ Batch error: {e}")
 
 @app.on_message(filters.command("cancel"))
+@ensure_allowed
 async def cmd_cancel(client: Client, message: Message):
     uid = message.from_user.id
-    if active_jobs.get(uid):
-        cancel_requests[uid] = True
-        await message.reply_text("⏹️ Cancelled.")
+    ev = active_jobs.get(uid)
+    if ev and not ev.is_set():
+        ev.set()
+        await message.reply_text("⏹️ Cancel requested. Stopping current job...")
     else:
         await message.reply_text("❌ No active operation to cancel.")
 
+# -------------- Start --------------
 if __name__ == "__main__":
     start_health_server()
     logger.info("Starting Telegram Save-Restricted Bot...")
